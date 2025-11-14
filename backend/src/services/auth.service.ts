@@ -5,6 +5,13 @@ import prisma from '../config/database';
 import { AppError } from '../middleware/errorHandler';
 import { UserRole } from '@prisma/client';
 import { logger } from '../utils/logger';
+import { AuditService } from './audit.service';
+import {
+  validatePasswordStrength,
+  isValidEmail,
+  isValidName,
+  sanitizeString,
+} from '../utils/validation';
 
 export interface RegisterData {
   email: string;
@@ -14,25 +21,69 @@ export interface RegisterData {
   role?: UserRole;
   dateOfBirth?: Date;
   parentId?: string;
+  ipAddress?: string;
+  userAgent?: string;
 }
 
 export interface LoginData {
   email: string;
   password: string;
+  ipAddress?: string;
+  userAgent?: string;
 }
 
 export class AuthService {
   /**
-   * Register a new user
+   * Register a new user with enhanced validation
    */
   static async register(data: RegisterData) {
     try {
+      // Validate email
+      if (!isValidEmail(data.email)) {
+        throw new AppError('Invalid email address', 400);
+      }
+
+      // Validate names
+      if (!isValidName(data.firstName)) {
+        throw new AppError('Invalid first name', 400);
+      }
+      if (!isValidName(data.lastName)) {
+        throw new AppError('Invalid last name', 400);
+      }
+
+      // Validate password strength
+      const passwordStrength = validatePasswordStrength(data.password);
+      if (!passwordStrength.isStrong) {
+        throw new AppError(
+          `Password is not strong enough: ${passwordStrength.feedback.join(', ')}`,
+          400
+        );
+      }
+
+      // Sanitize inputs
+      const sanitizedEmail = sanitizeString(data.email.toLowerCase());
+      const sanitizedFirstName = sanitizeString(data.firstName);
+      const sanitizedLastName = sanitizeString(data.lastName);
+
       // Check if user already exists
       const existingUser = await prisma.user.findUnique({
-        where: { email: data.email },
+        where: { email: sanitizedEmail },
       });
 
       if (existingUser) {
+        // Log failed registration attempt
+        await AuditService.logAuth(
+          undefined,
+          'REGISTER',
+          data.ipAddress,
+          data.userAgent,
+          {
+            email: sanitizedEmail,
+            success: false,
+            reason: 'Email already exists',
+          }
+        );
+
         throw new AppError('User with this email already exists', 400);
       }
 
@@ -47,7 +98,7 @@ export class AuthService {
         }
       }
 
-      // Hash password
+      // Hash password with high cost factor
       const hashedPassword = await bcrypt.hash(
         data.password,
         parseInt(process.env.BCRYPT_ROUNDS || '12')
@@ -56,10 +107,10 @@ export class AuthService {
       // Create user
       const user = await prisma.user.create({
         data: {
-          email: data.email,
+          email: sanitizedEmail,
           password: hashedPassword,
-          firstName: data.firstName,
-          lastName: data.lastName,
+          firstName: sanitizedFirstName,
+          lastName: sanitizedLastName,
           role: data.role || 'PARENT',
           dateOfBirth: data.dateOfBirth,
           parentId: data.parentId,
@@ -87,6 +138,19 @@ export class AuthService {
         });
       }
 
+      // Log successful registration
+      await AuditService.logAuth(
+        user.id,
+        'REGISTER',
+        data.ipAddress,
+        data.userAgent,
+        {
+          email: sanitizedEmail,
+          role: user.role,
+          success: true,
+        }
+      );
+
       // Generate tokens
       const tokens = this.generateTokens(user.id, user.role);
 
@@ -105,19 +169,37 @@ export class AuthService {
   }
 
   /**
-   * Login user
+   * Login user with enhanced security
    */
   static async login(data: LoginData) {
     try {
+      // Validate email format
+      if (!isValidEmail(data.email)) {
+        throw new AppError('Invalid credentials', 401);
+      }
+
       // Find user
       const user = await prisma.user.findUnique({
-        where: { email: data.email },
+        where: { email: data.email.toLowerCase() },
         include: {
           subscription: true,
         },
       });
 
       if (!user) {
+        // Log failed login attempt
+        await AuditService.logAuth(
+          undefined,
+          'LOGIN_FAILED',
+          data.ipAddress,
+          data.userAgent,
+          {
+            email: data.email,
+            reason: 'User not found',
+          }
+        );
+
+        // Use generic error message to prevent user enumeration
         throw new AppError('Invalid credentials', 401);
       }
 
@@ -125,6 +207,18 @@ export class AuthService {
       const isPasswordValid = await bcrypt.compare(data.password, user.password);
 
       if (!isPasswordValid) {
+        // Log failed login attempt
+        await AuditService.logAuth(
+          user.id,
+          'LOGIN_FAILED',
+          data.ipAddress,
+          data.userAgent,
+          {
+            email: data.email,
+            reason: 'Invalid password',
+          }
+        );
+
         throw new AppError('Invalid credentials', 401);
       }
 
@@ -133,6 +227,18 @@ export class AuthService {
         where: { id: user.id },
         data: { lastLoginAt: new Date() },
       });
+
+      // Log successful login
+      await AuditService.logAuth(
+        user.id,
+        'LOGIN',
+        data.ipAddress,
+        data.userAgent,
+        {
+          email: data.email,
+          success: true,
+        }
+      );
 
       // Generate tokens
       const tokens = this.generateTokens(user.id, user.role);
@@ -160,13 +266,21 @@ export class AuthService {
     const accessToken = jwt.sign(
       { userId, role },
       process.env.JWT_SECRET!,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+      {
+        expiresIn: process.env.JWT_EXPIRES_IN || '7d',
+        issuer: 'storycanvas',
+        audience: 'storycanvas-api',
+      }
     );
 
     const refreshToken = jwt.sign(
-      { userId, role },
+      { userId, role, type: 'refresh' },
       process.env.JWT_REFRESH_SECRET!,
-      { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' }
+      {
+        expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d',
+        issuer: 'storycanvas',
+        audience: 'storycanvas-api',
+      }
     );
 
     return { accessToken, refreshToken };
@@ -179,8 +293,17 @@ export class AuthService {
     try {
       const decoded = jwt.verify(
         refreshToken,
-        process.env.JWT_REFRESH_SECRET!
-      ) as { userId: string; role: UserRole };
+        process.env.JWT_REFRESH_SECRET!,
+        {
+          issuer: 'storycanvas',
+          audience: 'storycanvas-api',
+        }
+      ) as { userId: string; role: UserRole; type: string };
+
+      // Verify it's a refresh token
+      if (decoded.type !== 'refresh') {
+        throw new AppError('Invalid token type', 401);
+      }
 
       const user = await prisma.user.findUnique({
         where: { id: decoded.userId },
@@ -220,6 +343,14 @@ export class AuthService {
         },
       });
 
+      await AuditService.logAuth(
+        user.id,
+        'EMAIL_VERIFY',
+        undefined,
+        undefined,
+        { email: user.email }
+      );
+
       logger.info(`Email verified for user: ${user.email}`);
 
       return { message: 'Email verified successfully' };
@@ -234,14 +365,15 @@ export class AuthService {
   /**
    * Request password reset
    */
-  static async requestPasswordReset(email: string) {
+  static async requestPasswordReset(email: string, ipAddress?: string) {
     try {
       const user = await prisma.user.findUnique({
-        where: { email },
+        where: { email: email.toLowerCase() },
       });
 
       if (!user) {
         // Don't reveal if user exists
+        logger.warn('Password reset requested for non-existent email', { email, ipAddress });
         return { message: 'If the email exists, a reset link has been sent' };
       }
 
@@ -251,6 +383,14 @@ export class AuthService {
         where: { id: user.id },
         data: { passwordResetToken: resetToken },
       });
+
+      await AuditService.logAuth(
+        user.id,
+        'PASSWORD_RESET',
+        ipAddress,
+        undefined,
+        { email: user.email, action: 'request' }
+      );
 
       // TODO: Send email with reset token
       logger.info(`Password reset requested for: ${email}`);
@@ -267,6 +407,15 @@ export class AuthService {
    */
   static async resetPassword(token: string, newPassword: string) {
     try {
+      // Validate new password strength
+      const passwordStrength = validatePasswordStrength(newPassword);
+      if (!passwordStrength.isStrong) {
+        throw new AppError(
+          `Password is not strong enough: ${passwordStrength.feedback.join(', ')}`,
+          400
+        );
+      }
+
       const user = await prisma.user.findFirst({
         where: { passwordResetToken: token },
       });
@@ -288,6 +437,14 @@ export class AuthService {
         },
       });
 
+      await AuditService.logAuth(
+        user.id,
+        'PASSWORD_RESET',
+        undefined,
+        undefined,
+        { email: user.email, action: 'complete' }
+      );
+
       logger.info(`Password reset for user: ${user.email}`);
 
       return { message: 'Password reset successfully' };
@@ -296,6 +453,82 @@ export class AuthService {
       throw error instanceof AppError
         ? error
         : new AppError('Password reset failed', 500);
+    }
+  }
+
+  /**
+   * Change password (for authenticated user)
+   */
+  static async changePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string
+  ) {
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+      });
+
+      if (!user) {
+        throw new AppError('User not found', 404);
+      }
+
+      // Verify current password
+      const isPasswordValid = await bcrypt.compare(currentPassword, user.password);
+
+      if (!isPasswordValid) {
+        await AuditService.logAuth(
+          userId,
+          'PASSWORD_RESET',
+          undefined,
+          undefined,
+          { action: 'change_failed', reason: 'Invalid current password' }
+        );
+
+        throw new AppError('Current password is incorrect', 401);
+      }
+
+      // Validate new password strength
+      const passwordStrength = validatePasswordStrength(newPassword);
+      if (!passwordStrength.isStrong) {
+        throw new AppError(
+          `Password is not strong enough: ${passwordStrength.feedback.join(', ')}`,
+          400
+        );
+      }
+
+      // Check if new password is same as current
+      const isSamePassword = await bcrypt.compare(newPassword, user.password);
+      if (isSamePassword) {
+        throw new AppError('New password must be different from current password', 400);
+      }
+
+      const hashedPassword = await bcrypt.hash(
+        newPassword,
+        parseInt(process.env.BCRYPT_ROUNDS || '12')
+      );
+
+      await prisma.user.update({
+        where: { id: userId },
+        data: { password: hashedPassword },
+      });
+
+      await AuditService.logAuth(
+        userId,
+        'PASSWORD_RESET',
+        undefined,
+        undefined,
+        { action: 'change_success' }
+      );
+
+      logger.info(`Password changed for user: ${user.email}`);
+
+      return { message: 'Password changed successfully' };
+    } catch (error: any) {
+      logger.error('Password change error:', error);
+      throw error instanceof AppError
+        ? error
+        : new AppError('Password change failed', 500);
     }
   }
 }
