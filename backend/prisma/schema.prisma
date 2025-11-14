@@ -1,0 +1,268 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  PARENT
+  CHILD
+}
+
+enum SubscriptionTier {
+  FREE
+  PREMIUM
+  FAMILY
+  ENTERPRISE
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELED
+  PAST_DUE
+  TRIALING
+}
+
+enum BookStatus {
+  DRAFT
+  GENERATING
+  COMPLETED
+  PUBLISHED
+  FAILED
+}
+
+enum IllustrationStyle {
+  WATERCOLOR
+  CARTOON
+  REALISTIC
+  FANTASY
+  MINIMALIST
+  VINTAGE
+}
+
+enum ContentModerationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  FLAGGED
+}
+
+model User {
+  id                String              @id @default(uuid())
+  email             String              @unique
+  password          String
+  role              UserRole            @default(PARENT)
+  firstName         String
+  lastName          String
+  avatarUrl         String?
+  dateOfBirth       DateTime?
+  isEmailVerified   Boolean             @default(false)
+  emailVerifyToken  String?
+  passwordResetToken String?
+
+  // Parent-Child relationship
+  parentId          String?
+  parent            User?               @relation("ParentChild", fields: [parentId], references: [id], onDelete: Cascade)
+  children          User[]              @relation("ParentChild")
+
+  // Subscription
+  subscription      Subscription?
+
+  // Books
+  books             Book[]
+  favoriteBooks     Book[]              @relation("FavoriteBooks")
+
+  // Activity
+  bookViews         BookView[]
+
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  lastLoginAt       DateTime?
+
+  @@index([email])
+  @@index([parentId])
+}
+
+model Subscription {
+  id                String              @id @default(uuid())
+  userId            String              @unique
+  user              User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tier              SubscriptionTier    @default(FREE)
+  status            SubscriptionStatus  @default(ACTIVE)
+
+  stripeCustomerId  String?             @unique
+  stripeSubscriptionId String?          @unique
+  stripePriceId     String?
+
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean            @default(false)
+
+  booksCreatedThisMonth Int             @default(0)
+  monthlyBookLimit      Int             @default(3)
+
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  @@index([userId])
+  @@index([stripeCustomerId])
+}
+
+model Book {
+  id                String              @id @default(uuid())
+  title             String
+  description       String
+  storyPrompt       String              @db.Text
+
+  // Generated content
+  content           String              @db.Text
+  pages             Page[]
+
+  // Metadata
+  authorId          String
+  author            User                @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  status            BookStatus          @default(DRAFT)
+  illustrationStyle IllustrationStyle   @default(CARTOON)
+
+  language          String              @default("en")
+  ageRange          String              @default("3-8")
+
+  // Moderation
+  moderationStatus  ContentModerationStatus @default(PENDING)
+  moderationResults Json?
+  moderationNotes   String?
+
+  // Publishing
+  isPublic          Boolean             @default(false)
+  publishedAt       DateTime?
+
+  // Stats
+  views             BookView[]
+  favoritedBy       User[]              @relation("FavoriteBooks")
+  viewCount         Int                 @default(0)
+  favoriteCount     Int                 @default(0)
+
+  // Cover
+  coverImageUrl     String?
+  thumbnailUrl      String?
+
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  @@index([authorId])
+  @@index([status])
+  @@index([isPublic])
+  @@index([createdAt])
+}
+
+model Page {
+  id                String              @id @default(uuid())
+  bookId            String
+  book              Book                @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  pageNumber        Int
+  content           String              @db.Text
+
+  // Image generation
+  imagePrompt       String              @db.Text
+  imageUrl          String?
+  imageGenerationId String?
+
+  // Moderation
+  moderationStatus  ContentModerationStatus @default(PENDING)
+  moderationResults Json?
+
+  // Animation settings
+  animationData     Json?
+
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  @@unique([bookId, pageNumber])
+  @@index([bookId])
+}
+
+model BookView {
+  id                String              @id @default(uuid())
+  bookId            String
+  book              Book                @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  userId            String?
+  user              User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  ipAddress         String?
+  userAgent         String?
+
+  viewedAt          DateTime            @default(now())
+
+  @@index([bookId])
+  @@index([userId])
+  @@index([viewedAt])
+}
+
+model AIGenerationLog {
+  id                String              @id @default(uuid())
+
+  type              String              // 'text' or 'image'
+  model             String
+  prompt            String              @db.Text
+  response          String?             @db.Text
+
+  tokensUsed        Int?
+  cost              Float?
+
+  success           Boolean             @default(true)
+  error             String?
+
+  // Moderation
+  moderationPassed  Boolean?
+  moderationFlags   Json?
+
+  userId            String?
+
+  createdAt         DateTime            @default(now())
+
+  @@index([type])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model SystemSettings {
+  id                String              @id @default(uuid())
+  key               String              @unique
+  value             String              @db.Text
+  description       String?
+
+  updatedAt         DateTime            @updatedAt
+
+  @@index([key])
+}
+
+model AuditLog {
+  id                String              @id @default(uuid())
+
+  userId            String?
+  action            String
+  resource          String
+  resourceId        String?
+
+  ipAddress         String?
+  userAgent         String?
+
+  metadata          Json?
+
+  createdAt         DateTime            @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+}
